@@ -1,0 +1,1 @@
+{"audience":"有 C++/并发经验的工程师（项目维护者本人）","reader_task":"复盘整个无锁跳表调试过程，掌握每个 bug 的现象、根因与修复，可作为后续维护参考","genre_contract":"knowledge","adapter":null,"presentation_mode":"normal","visual_plan":{"reason":"用表格汇总 bug 清单与验证结果，代码块展示关键修复","blocks":[]}}
