@@ -1,0 +1,237 @@
+<h1>附录：逐行源码分析（commit 4d05f8c → 211e11c）</h1>
+
+<p>以下按函数对比初始版本（有 bug）和修复版本，逐行解释原理和改动原因。</p>
+
+<h2>A1. 节点结构：新增 level 字段</h2>
+
+<pre lang="cpp" caption="修复前"><code>struct SkipListNode {
+    const void* value;
+    std::vector&lt;std::atomic&lt;SkipListNode*&gt;&gt; forward;
+    std::atomic&lt;bool&gt; marked;
+    std::atomic&lt;bool&gt; fullyLinked;
+};</code></pre>
+
+<pre lang="cpp" caption="修复后"><code>struct SkipListNode {
+    const void* value;
+    int level;  // 新增：记录这个节点实际被分配了几层
+    std::vector&lt;std::atomic&lt;SkipListNode*&gt;&gt; forward;
+    std::atomic&lt;bool&gt; marked;
+    std::atomic&lt;bool&gt; fullyLinked;
+};</code></pre>
+
+<p><b>为什么加？</b> <code>forward</code> 是 <code>vector</code>，构造时按 <code>level+1</code> 分配。比如 randomLevel() 返回 3，forward 只有下标 0..3 共 4 个元素。但 remove 原来从 maxLevel(16) 往下遍历到 0，访问 forward[4] 到 forward[16] 就是堆越界——ASan 报的 heap-buffer-overflow 就是这一行。修复后节点记住自己的 level，remove 从 level-1 开始。</p>
+
+<h2>A2. findNode()：核心遍历函数，改了三处</h2>
+
+<h3>修复前（4d05f8c）</h3>
+<pre lang="cpp"><code>bool LockFreeSkipList::findNode(...) const {
+    bool found = false;
+    SkipListNode* pred = head_;
+    for (int i = maxLevel_; i &gt;= 0; --i) {
+        SkipListNode* curr = pred-&gt;forward[i].load(acquire);   // L1
+        while (true) {
+            SkipListNode* succ = curr-&gt;forward[i].load(acquire);  // L2
+            if (curr != tail_ &amp;&amp; compareFunc_(curr-&gt;value, value) &lt; 0) {  // L3
+                pred = curr;
+                curr = succ;
+            } else {
+                break;
+            }
+        }
+        preds[i] = pred;
+        succs[i] = curr;
+        if (curr != tail_ &amp;&amp; compareFunc_(curr-&gt;value, value) == 0) {
+            found = true;
+        }
+    }
+    return found;
+}</code></pre>
+
+<h3>逐行问题分析</h3>
+<ul>
+<li><b>L2</b>：tail_ 节点构造时 forward[i] 全部初始化为 nullptr。当 curr==tail_ 时，L2 读 tail_->forward[i] 得到 nullptr。修复过程中加了"跳过 marked 节点"的内层 while，那个 while 先读 next->marked，如果 next 是 null 就崩。</li>
+<li><b>L3</b>：条件是 curr != tail_ && compare(...) &lt; 0。中间有个版本误改成了 next != tail_ && compare(...) &lt; 0，导致 curr 是倒数第二个节点、succ 是 tail_ 且 curr->value &lt; value 时不前进，单线程就丢首尾节点。</li>
+</ul>
+
+<h3>修复后（211e11c）</h3>
+<pre lang="cpp"><code>bool LockFreeSkipList::findNode(...) const {
+    SkipListNode* pred = head_;
+    for (int level = maxLevel_; level &gt;= 0; --level) {
+        SkipListNode* curr = pred-&gt;forward[level].load(acquire);  // L1
+        while (true) {
+            if (curr == tail_ || curr == nullptr) break;           // L2 新增
+            SkipListNode* next = curr-&gt;forward[level].load(acquire); // L3
+            if (compareFunc_(curr-&gt;value, value) &lt; 0) {             // L4 去掉冗余判断
+                pred = curr;
+                curr = next;
+            } else {
+                break;
+            }
+        }
+        preds[level] = pred;
+        succs[level] = curr;
+    }
+    SkipListNode* curr = succs[0];
+    return curr != tail_ &amp;&amp; compareFunc_(curr-&gt;value, value) == 0;
+}</code></pre>
+
+<ul>
+<li><b>L2</b>：先检查 curr == tail_ || curr == nullptr 再往下走，杜绝解引用 tail_ 的 forward（null）。</li>
+<li><b>L4</b>：去掉了 curr != tail_，因为 L2 已经保证 curr 不是 tail_ 了。只要 curr->value &lt; value 就前进，不管 next 是谁。</li>
+</ul>
+
+<h2>A3. insert()：CAS 失败后补写 forward</h2>
+
+<h3>修复前</h3>
+<pre lang="cpp"><code>for (int i = 1; i &lt; topLevel; ++i) {
+    while (true) {
+        pred = preds[i];
+        succ = succs[i];
+        if (pred-&gt;forward[i].compare_exchange_strong(succ, newNode, ...)) {
+            break;
+        }
+        findNode(value, preds, succs);  // 刷新了 preds/succs
+    }
+}</code></pre>
+
+<h3>问题时序</h3>
+<ol>
+<li>线程 A 在 level=3 找到 pred=P, succ=S，把 newNode-&gt;forward[3] = S</li>
+<li>CAS 失败：P-&gt;forward[3] 被另一个线程改成了 S'（不是 S）</li>
+<li>调 findNode 刷新，得到新的 pred=P', succ=S'</li>
+<li>但 newNode-&gt;forward[3] 还指向旧的 S</li>
+<li>下一轮 CAS 成功后，newNode-&gt;forward[3] 指向 S——但 S 已经不是 newNode 后面的节点了</li>
+</ol>
+<p>结果：跳表在 level=3 上断链，从 newNode 跳到了旧的 S。单线程下不触发，并发 insert 就丢节点。</p>
+
+<h3>修复后</h3>
+<pre lang="cpp"><code>for (int i = 1; i &lt; topLevel; ++i) {
+    while (true) {
+        pred = preds[i];
+        succ = succs[i];
+        newNode-&gt;forward[i].store(succ, relaxed);  // 关键：先写 forward 指向最新 succ
+        if (pred-&gt;forward[i].compare_exchange_strong(succ, newNode, ...)) {
+            break;
+        }
+        findNode(value, preds, succs);
+    }
+}</code></pre>
+
+<h2>A4. remove()：三处修复</h2>
+
+<h3>A4.1 遍历范围越界</h3>
+<pre lang="cpp"><code>// 修复前：从 maxLevel(16) 开始
+for (int i = maxLevel_; i &gt;= 0; --i) {
+
+// 修复后：从节点实际层数开始
+for (int i = nodeToRemove-&gt;level - 1; i &gt;= 0; --i) {</code></pre>
+<p>节点的 forward 只分配了 level+1 个元素。从 16 开始访问 forward[4] 就是越界。</p>
+
+<h3>A4.2 CAS 失败后不检查 findNode 返回值</h3>
+<pre lang="cpp"><code>// 修复前
+if (pred-&gt;forward[i].compare_exchange_strong(succ, next, ...)) break;
+findNode(value, preds, succs);  // 返回值被忽略
+
+// 修复后
+if (pred-&gt;forward[i].compare_exchange_strong(succ, next, ...)) break;
+if (!findNode(value, preds, succs)) {
+    return;  // 节点已被其他线程摘除，直接退出
+}</code></pre>
+<p>场景：线程 A 正在摘除节点 X，线程 B 也来 remove(X)。B 的 findNode 找到了 X，CAS marked 失败（A 已经标了），continue 后重新 findNode——这时 X 已经被 A 物理摘除，findNode 返回 false。修复前代码忽略 false，继续用过期的 preds/succs 做 CAS，永远失败，死循环。</p>
+
+<h3>A4.3 不直接 delete，走 EBR</h3>
+<pre lang="cpp"><code>// 修复前：直接 delete，其他线程可能还在读这个节点
+destroyNode(nodeToRemove);
+
+// 修复后：延迟回收
+retireNode(nodeToRemove);</code></pre>
+<p>无锁数据结构最经典的坑：你 CAS 把节点从链表里摘掉了，但另一个线程可能刚读完 curr = pred-&gt;forward[i]，正准备读 curr-&gt;forward[i]。你一 delete，它就 UAF。</p>
+
+<h2>A5. find() / findMin() / getNextNode()：跳过 marked 节点</h2>
+
+<pre lang="cpp"><code>SkipListNode* next = curr-&gt;forward[i].load(acquire);
+// 新增：跳过逻辑删除但还没物理摘除的节点
+while (next != tail_ &amp;&amp; next-&gt;marked.load(acquire)) {
+    next = next-&gt;forward[i].load(acquire);
+}</code></pre>
+
+<p>Herlihy-Shavit 的 lazy deletion 分两步：先 CAS marked=true（逻辑删除），再逐层 unlink（物理摘除）。在这两步之间，节点还在链表里但 marked=true。只读路径如果不跳过 marked 节点，会找到一个即将被删除的节点并返回给调用方。</p>
+
+<h2>A6. EBR（Epoch-Based Reclamation）：新增 80 行</h2>
+
+<h3>原理</h3>
+<p>无锁数据结构不能 delete 正在被其他线程访问的节点。EBR 的思路：</p>
+<ul>
+<li>global_epoch（原子计数器，初始 0）</li>
+<li>每个线程有 active（bool）+ epoch（它观察到的全局 epoch）</li>
+<li>线程进入临界区：epoch = global_epoch.load()，active = true</li>
+<li>线程离开：active = false</li>
+<li>回收节点：挂到 retired 列表，记录当前 epoch；如果所有活跃线程的 epoch 都 >= global_epoch，说明没有线程还停留在旧 epoch，安全回收</li>
+</ul>
+
+<h3>关键代码</h3>
+<pre lang="cpp"><code>void LockFreeSkipList::retireNode(SkipListNode* node) {
+    uint64_t epoch = e.global_epoch.load(relaxed);
+    bool needReclaim = false;
+    {
+        std::lock_guard lock(retired_mutex_);
+        retired_.push_back({node, epoch});
+        needReclaim = (retired_.size() &gt; 64);  // 原来这行在锁外，TSan race
+    }
+    if (needReclaim) tryReclaim();
+}
+
+void LockFreeSkipList::tryReclaim() {
+    uint64_t current = e.global_epoch.load(relaxed);
+    bool allObserved = true;
+    for (int i = 0; i &lt; e.next_tid; ++i) {
+        if (e.threads[i].active.load(acquire)) {
+            if (e.threads[i].epoch.load(acquire) &lt; current) {
+                allObserved = false;
+                break;
+            }
+        }
+    }
+    if (!allObserved) {
+        e.global_epoch.store(current + 1, release);
+        return;
+    }
+    // 所有线程都观察到了 current，可以安全回收旧节点
+    std::lock_guard lock(retired_mutex_);
+    for (auto& r : retired_) {
+        if (r.epoch &lt; current) delete r.node;
+    }
+}</code></pre>
+
+<p><b>为什么 retired_.size() 那行要挪进锁内？</b> 原来在锁外读 retired_.size()，另一个线程在锁内 push_back 改 size——TSan 直接报 data race。挪进锁内后用局部变量 needReclaim 带出，锁外判断。</p>
+
+<h2>A7. 内存序选择</h2>
+
+<table>
+<thead><tr><th>位置</th><th>memory_order</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>forward[i].load()</td><td>acquire</td><td>读别人写的指针，需要看到对方 release 的所有写入</td></tr>
+<tr><td>forward[i].store(succ, relaxed)</td><td>relaxed</td><td>初始化新节点的 forward，还没发布给其他线程</td></tr>
+<tr><td>CAS 成功时</td><td>release</td><td>发布节点，确保对方 acquire 后能看到新节点的完整状态</td></tr>
+<tr><td>CAS 失败时</td><td>relaxed</td><td>只是比较旧值，不建立同步关系</td></tr>
+<tr><td>marked.store(true, release)</td><td>release</td><td>标记删除，其他线程 acquire 读到后能看到节点已就绪</td></tr>
+<tr><td>fullyLinked.store(true, release)</td><td>release</td><td>节点完全链接，其他线程读到后可以安全遍历</td></tr>
+</tbody>
+</table>
+
+<h2>A8. commit 211e11c 改动汇总</h2>
+
+<table>
+<thead><tr><th>改动</th><th>行数</th><th>根因</th></tr></thead>
+<tbody>
+<tr><td>EBR 回收机制</td><td>+80 行</td><td>remove 后直接 delete 导致 UAF</td></tr>
+<tr><td>findNode 加 null/tail 守卫</td><td>+3 行</td><td>tail_->forward 是 null</td></tr>
+<tr><td>findNode 去掉错误条件</td><td>-2 行</td><td>next!=tail_ 阻止前进</td></tr>
+<tr><td>insert CAS 失败补写 forward</td><td>+1 行</td><td>重试后 forward 指向旧 succ</td></tr>
+<tr><td>remove 遍历范围改为 node.level-1</td><td>1 行</td><td>越界访问 vector</td></tr>
+<tr><td>remove 检查 findNode 返回值</td><td>+3 行</td><td>死循环</td></tr>
+<tr><td>find/findMin/getNextNode 跳过 marked</td><td>+9 行</td><td>返回逻辑删除的节点</td></tr>
+<tr><td>EBR size 判断挪进锁内</td><td>3 行</td><td>TSan data race</td></tr>
+<tr><td>节点加 level 字段</td><td>+1 行</td><td>记录实际层数防越界</td></tr>
+</tbody>
+</table>
