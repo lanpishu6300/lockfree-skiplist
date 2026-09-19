@@ -1,0 +1,172 @@
+<h1>附录二：深度原理分析</h1>
+
+<h2>B1. Herlihy-Shavit Lazy Deletion 正确性论证</h2>
+
+<p>无锁跳表的删除分三步，每一步都有严格的不变式（invariant）保证：</p>
+
+<h3>三步删除协议</h3>
+<ol>
+<li><b>逻辑标记</b>：CAS <code>marked: false → true</code>。这一步是单点原子操作，保证只有一个线程能标记成功。</li>
+<li><b>逐层摘除</b>：从高层到低层，CAS <code>pred-&gt;forward[i] = node-&gt;forward[i]</code>。</li>
+<li><b>延迟回收</b>：EBR 保证没有线程再访问这个节点后才 delete。</li>
+</ol>
+
+<h3>关键不变式</h3>
+<table>
+<thead><tr><th>不变式</th><th>为什么成立</th></tr></thead>
+<tbody>
+<tr><td>marked=true 的节点不会被其他线程再次 remove</td><td>remove 开头 CAS marked: false→true，失败的线程 continue 重试，不会重复摘除</td></tr>
+<tr><td>marked=true 的节点不会被 insert 再次插入</td><td>findNode 找到等值节点后 insert 返回 nullptr</td></tr>
+<tr><td>其他线程遍历时不会卡在 marked 节点上</td><td>find() 和 findNode() 跳过 marked 节点（修复后）</td></tr>
+<tr><td>节点被 delete 时没有线程在读它</td><td>EBR：所有活跃线程的 epoch 都已推进到当前 epoch</td></tr>
+</tbody>
+</table>
+
+<h3>为什么需要 fullyLinked？</h3>
+<p>insert 时先 CAS level-0 链接节点，再逐层链接高层，最后才设 <code>fullyLinked=true</code>。在 fullyLinked=false 期间，节点只在 level-0 可见。如果此时另一个线程来 remove 这个节点：</p>
+<ul>
+<li>findNode 会找到它（在 level-0）</li>
+<li>但 remove 检查 <code>!fullyLinked</code> 后直接返回，不做摘除</li>
+<li>等 insert 完成所有高层链接并设 fullyLinked=true 后，remove 才能正常工作</li>
+</ul>
+<p>这避免了"摘除了一个还没完全链接的节点"导致的高层指针悬空。</p>
+
+<h2>B2. arm64 vs x86 内存模型：为什么 bug 在 macOS 上才暴露</h2>
+
+<h3>内存模型差异</h3>
+<table>
+<thead><tr><th>特性</th><th>x86 (TSO)</th><th>arm64 (weak)</th></tr></thead>
+<tbody>
+<tr><td>Store 顺序</td><td>所有线程看到的 store 顺序一致</td><td>不同线程看到的 store 顺序可以不同</td></tr>
+<tr><td>StoreLoad 重排</td><td>禁止</td><td>允许</td></tr>
+<tr><td>StoreStore 重排</td><td>禁止</td><td>允许（但 DMB 可阻止）</td></tr>
+<tr><td>LoadLoad 重排</td><td>禁止</td><td>允许</td></tr>
+<tr><td>需要的屏障</td><td>CAS 自带 full barrier</td><td>需要 acquire/release 显式标注</td></tr>
+</tbody>
+</table>
+
+<h3>具体影响</h3>
+<p>原代码在 x86 上"碰巧正确"的原因：</p>
+<ol>
+<li><b>PRNG race</b>：x86 上 mt19937 的内部状态更新虽然没有同步，但 TSO 模型下两个线程的写不会真正同时发生在同一个 cache line 上（MESI 协议串行化），所以概率上很少 corrupt。arm64 上两个核可以同时写同一个 cache line 的不同字节，直接 corrupt。</li>
+<li><b>forward 指针发布</b>：原代码 insert 时先写 newNode-&gt;forward[i]（relaxed），再 CAS pred-&gt;forward[i]（release）。在 x86 上，即使没有 release 语义，CAS 本身就是 full barrier，前面的写不会被重排到 CAS 之后。arm64 上没有这个保证，必须显式写 release。</li>
+<li><b>tail_ 空指针</b>：这不是内存模型问题，是纯逻辑 bug，在哪个平台都会崩——只是原测试在 Linux 上碰巧没跑到那个路径。</li>
+</ol>
+
+<h3>为什么 TSan 在 arm64 上更严格</h3>
+<p>TSan 不依赖实际内存模型，它在编译时插入 happens-before 边追踪。即使 x86 上"碰巧"没崩，TSan 也能抓到 PRNG race——因为它检测的是"两个线程对同一内存的访问没有同步关系"，不管硬件实际怎么执行。</p>
+
+<h2>B3. ABA 问题分析</h2>
+
+<h3>什么是 ABA</h3>
+<p>线程 1 读位置 X 的值为 A，被抢占；线程 2 把 X 改成 B 又改回 A；线程 1 醒来 CAS 成功，但中间状态已经变了。经典例子是无锁栈：pop 时 top 从 A 变 B 再变 A，CAS 成功但 A 已经不是原来的节点了。</p>
+
+<h3>这个跳表有没有 ABA？</h3>
+<p><b>没有。</b>原因：</p>
+<ol>
+<li><b>key 不可变</b>：节点的 value 指针在构造后不变，不会被复用。</li>
+<li><b>删除的节点不立即复用</b>：EBR 保证节点被 delete 前所有线程都已离开临界区，不会出现"A 节点被 delete 后又分配了新节点 B，地址碰巧等于 A"的情况。</li>
+<li><b>CAS 的比较对象是指针</b>：pred-&gt;forward[i] 的值是节点指针。即使 key 相同，新节点的指针地址一定不同（new 分配），CAS 不会误判。</li>
+</ol>
+<p>如果不用 EBR 而是用引用计数或立即 delete，就会有 ABA：节点 A 被 delete 后，malloc 把同一块内存分配给新节点 B，线程 1 的 CAS 看到指针值相同就误判成功。</p>
+
+<h2>B4. 随机层数的概率数学</h2>
+
+<h3>为什么是 0.5</h3>
+<pre lang="cpp"><code>int level = 1;
+while (dis(gen) &lt; 0.5 &amp;&amp; level &lt; maxLevel) level++;</code></pre>
+
+<p>每个节点出现在 level k 的概率：</p>
+<ul>
+<li>P(level ≥ 1) = 1（必在 level 0）</li>
+<li>P(level ≥ 2) = 0.5</li>
+<li>P(level ≥ 3) = 0.25</li>
+<li>P(level ≥ k) = 0.5^(k-1)</li>
+</ul>
+
+<h3>期望层数</h3>
+<p>E[level] = Σ P(level ≥ k) = 1 + 0.5 + 0.25 + ... = 2（等比级数，极限 2）</p>
+<p>maxLevel=16 时，节点到达 level 16 的概率是 0.5^15 ≈ 0.003%，足够低。</p>
+
+<h3>期望查找长度</h3>
+<p>每层期望跳过 1/0.5 = 2 个节点，maxLevel 层期望比较次数 ≈ 2 × maxLevel = O(log n)。这是跳表为什么不需要平衡操作的原因：随机化保证了期望平衡。</p>
+
+<h2>B5. TSan 检测原理</h2>
+
+<h3>Vector Clock</h3>
+<p>TSan 给每个内存地址维护一个"访问历史"：哪个线程、什么时候（用 vector clock）、读还是写。两个访问如果：</p>
+<ol>
+<li>都对同一地址</li>
+<li>至少一个是写</li>
+<li>没有 happens-before 关系（vector clock 不序）</li>
+</ol>
+<p>→ 就是 data race。</p>
+
+<h3>happens-before 怎么建立</h3>
+<table>
+<thead><tr><th>同步原语</th><th>TSan 怎么识别</th></tr></thead>
+<tbody>
+<tr><td>mutex lock/unlock</td><td>unlock 的 vector clock 合并到后续 lock 的线程</td></tr>
+<tr><td>thread create/join</td><td>create 合并到子线程，join 合并到父线程</td></tr>
+<tr><td>atomic load(acquire)</td><td>与 atomic store(release) 建立 happens-before</td></tr>
+<tr><td>fence</td><td>full barrier 同步两边 vector clock</td></tr>
+</tbody>
+</table>
+
+<h3>为什么 retired_.size() 那行被抓</h3>
+<p>retireNode 在锁外读 <code>retired_.size()</code>（TSan 看到 thread T11 读 vector 内部 size 字段），另一个线程在锁内 push_back 写同一个字段（T10 写）。两个访问之间没有 mutex 或 atomic 同步——TSan 不知道它们有 happens-before 关系，于是报 race。挪进锁内后，lock/unlock 建立了 happens-before，race 消失。</p>
+
+<h2>B6. EBR vs Hazard Pointer</h2>
+
+<table>
+<thead><tr><th>维度</th><th>EBR（本实现）</th><th>Hazard Pointer</th></tr></thead>
+<tbody>
+<tr><td>每个线程开销</td><td>1 个 active + 1 个 epoch（8 字节）</td><td>每访问一个节点设一个 hazard（64 个槽位）</td></tr>
+<tr><td>读路径开销</td><td>几乎为零</td><td>每次读节点写 hazard（cache line  bouncing）</td></tr>
+<tr><td>回收延迟</td><td>至少一个 epoch 周期</td><td>立即（没有 hazard 就可删）</td></tr>
+<tr><td>内存使用</td><td>retired 列表可能增长</td><td>hazard 表固定大小</td></tr>
+<tr><td>实现复杂度</td><td>中等</td><td>较高</td></tr>
+<tr><td>适合场景</td><td>读多写少、延迟不敏感</td><td>写多读少、低延迟</td></tr>
+</tbody>
+</table>
+
+<p>本实现选 EBR 是因为跳表读多写少，读路径零开销比精确回收更重要。</p>
+
+<h2>B7. 性能基准（100K 节点，4 线程）</h2>
+
+<table>
+<thead><tr><th>线程数</th><th>insert (s)</th><th>find (s)</th><th>remove (s)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>0.024</td><td>0.010</td><td>24.669</td></tr>
+<tr><td>2</td><td>0.012</td><td>0.005</td><td>26.580</td></tr>
+<tr><td>4</td><td>0.011</td><td>0.002</td><td>24.903</td></tr>
+<tr><td>8</td><td>0.011</td><td>0.002</td><td>25.911</td></tr>
+</tbody>
+</table>
+
+<h3>数据分析</h3>
+<ul>
+<li><b>insert/find 线性扩展</b>：4 线程比单线程快 2-5 倍，说明 CAS 竞争可控。</li>
+<li><b>remove 异常慢（25 秒）</b>：这是 EBR 实现的性能 bug。问题在 tryReclaim：当 not allObserved 时只递增 epoch 就返回，但 retired 列表里的节点 epoch 永远是旧的，下一轮 tryReclaim 又遇到 not allObserved（因为新进入的线程记录的是新 epoch），形成活锁。100K remove 触发了 ~1500 次 tryReclaim，每次都空转。</li>
+<li><b>修复方向</b>：tryReclaim 应该只在真正能回收时才递增 epoch，而不是每次 not allObserved 都递增。或者用 epoch 批量推进：把 retired 按 epoch 分代，只回收确定安全的那一代。</li>
+</ul>
+
+<callout emoji="⚠️" background-color="light-orange">
+<p><b>已知性能问题</b>：当前 EBR 实现的 remove 路径有活锁导致的性能退化（25 秒/10 万次）。功能正确性已验证（TSan/ASan 干净），但生产使用前需要优化 tryReclaim 的 epoch 推进策略。</p>
+</callout>
+
+<h2>B8. 总结：从 bug 到原理的认知链</h2>
+
+<table>
+<thead><tr><th>现象</th><th>直接原因</th><th>深层原理</th></tr></thead>
+<tbody>
+<tr><td>SEGV at 0x20</td><td>tail_ forward 是 null</td><td>哨兵节点设计：forward 初始化为 null 而不是指向自身</td></tr>
+<tr><td>单线程丢首尾</td><td>前进条件写错</td><td>跳表遍历终止条件：curr-&gt;value &gt;= value 才停</td></tr>
+<tr><td>heap-buffer-overflow</td><td>forward[i] 越界</td><td>vector 大小 = level+1，不能从 maxLevel 遍历</td></tr>
+<tr><td>死循环</td><td>不检查 findNode 返回值</td><td>并发删除下节点可能已不存在</td></tr>
+<tr><td>TSan: PRNG race</td><td>static mt19937 共享</td><td>函数局部 static 在多线程下必须 thread_local 或加锁</td></tr>
+<tr><td>并发 insert 丢节点</td><td>CAS 重试不更新 forward</td><td>无锁结构 retry 路径必须重新发布新节点状态</td></tr>
+<tr><td>TSan: retired_ race</td><td>锁外读 size</td><td>TSan 追踪 happens-before，跨锁访问必须在锁内</td></tr>
+<tr><td>remove 25 秒</td><td>EBR epoch 活锁</td><td>EBR 推进策略需要区分"尝试回收"和"必须回收"</td></tr>
+</tbody>
+</table>
