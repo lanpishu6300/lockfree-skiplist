@@ -1,0 +1,157 @@
+<title>无锁跳表并发调试复盘：从段错误到 TSan/ASan 零告警</title>
+
+<p>本文记录一个 C++17 无锁跳表（Herlihy-Shavit 算法）从交易系统代码中抽出后，在 macOS arm64 上做并发正确性验证的完整过程。按<b>由浅入深</b>排列：从测试侧笔误开始，到空指针、越界、死循环，最后到真正的并发同步缺陷。每一步给出现象、根因、修复代码和验证方式。</p>
+
+<callout emoji="📌" background-color="light-blue">
+<p><b>最终状态</b>：ThreadSanitizer 零数据竞争，AddressSanitizer 零内存错误，4 线程 × 1000 次 insert/find/remove 连续 10 轮全通过。</p>
+</callout>
+
+<h1>1. 背景与环境</h1>
+
+<h2>1.1 原始问题</h2>
+<p>从交易系统抽出的 <code>LockFreeSkipList</code> 在 Linux/Windows 下运行正常，移植到 macOS arm64 单独编译测试时，4 线程并发执行 insert/find/remove 会段错误（exit 139）。</p>
+
+<h2>1.2 验证工具链</h2>
+<table>
+<thead><tr><th>工具</th><th>用途</th><th>编译参数</th></tr></thead>
+<tbody>
+<tr><td>lldb</td><td>抓取初始崩溃栈，定位首崩行</td><td>默认</td></tr>
+<tr><td>AddressSanitizer</td><td>堆越界、UAF、空指针</td><td><code>-fsanitize=address -O1</code></td></tr>
+<tr><td>ThreadSanitizer</td><td>数据竞争、锁序、死锁</td><td><code>-fsanitize=thread -O1</code></td></tr>
+<tr><td>stress loop</td><td>确认修复后稳定性</td><td><code>-O2 -pthread</code> 跑 10 轮</td></tr>
+</tbody>
+</table>
+
+<h2>1.3 编译命令</h2>
+<pre lang="bash"><code>clang++ -std=c++17 -O2 -g -Wall -Wextra -pthread -Iinclude \
+    src/lockfree_skiplist.cpp tests/test_concurrent.cpp -o build/test</code></pre>
+
+<h1>2. Bug 清单（按难度递进）</h1>
+
+<table>
+<thead><tr><th>#</th><th>层级</th><th>类别</th><th>现象</th><th>检测工具</th></tr></thead>
+<tbody>
+<tr><td>0</td><td>测试侧</td><td>悬垂指针</td><td>跨线程解引用栈帧，段错误</td><td>lldb</td></tr>
+<tr><td>1</td><td>测试侧</td><td>分配器参数笔误</td><td>申请 10TB 内存，TSan 分配器拒绝</td><td>TSan</td></tr>
+<tr><td>2</td><td>明显</td><td>tail_ forward 为 null</td><td>SEGV at 0x20（offset 32）</td><td>ASan</td></tr>
+<tr><td>3</td><td>明显</td><td>findNode 前进条件错误</td><td>单线程就丢首末节点</td><td>单测</td></tr>
+<tr><td>4</td><td>中等</td><td>节点 forward 越界</td><td>heap-buffer-overflow</td><td>ASan</td></tr>
+<tr><td>5</td><td>中等</td><td>remove 死循环</td><td>挂起不退出</td><td>超时</td></tr>
+<tr><td>6</td><td>并发</td><td>PRNG 数据竞争</td><td>TSan 报 7 个 race</td><td>TSan</td></tr>
+<tr><td>7</td><td>并发</td><td>insert 重试未更新 forward</td><td>并发 insert 后 find 丢节点</td><td>并发测试</td></tr>
+<tr><td>8</td><td>并发</td><td>EBR 锁外读</td><td>TSan 报 retired_ race</td><td>TSan</td></tr>
+</tbody>
+</table>
+
+<h1>3. Level 0：测试侧两个笔误</h1>
+
+<h2>3.1 悬垂指针（原代码最严重的 bug）</h2>
+<p>原始测试代码把局部循环变量 <code>i</code> 的地址存进跳表：</p>
+<pre lang="cpp"><code>void concurrentInsert(int start, int end) {
+    for (int i = start; i &lt; end; ++i) {
+        skipList.insert(&amp;i);  // &amp;i 指向栈帧
+    }
+}  // 函数返回，栈帧回收</code></pre>
+<p>函数返回后栈帧失效，其他线程通过跳表解引用 <code>&amp;i</code> 即段错误。lldb 抓到的崩溃栈显示两个线程都在 <code>compareInt</code> 里读 <code>0x...eec</code>（他线程已回收的栈地址）。</p>
+<p><b>修复</b>：用全局数组存值，指针在整个测试期间有效。</p>
+<pre lang="cpp"><code>static int values[4000];
+values[i] = i;
+list.insert(&amp;values[i]);</code></pre>
+
+<h2>3.2 分配器参数笔误</h2>
+<p>原代码 <code>CNormalMemoryAllocator(10000000, 100)</code>，构造函数里 <code>dwMemorySize = 1024*1024*memorySize</code>，实际申请 10,000,000 MB ≈ <b>10 TB</b>。正常构建 macOS 虚拟内存超提交让它"通过"，TSan 分配器有 64GB 硬上限直接拒绝。</p>
+<p><b>修复</b>：改为 100MB 即可（4000 个节点远用不完）。</p>
+
+<h1>4. Level 1：空指针与越界</h1>
+
+<h2>4.1 tail_ 的 forward 是 null</h2>
+<p>ASan 报 <code>SEGV on unknown address 0x000000000020</code>，栈顶在 <code>findNode</code>。原因：</p>
+<ul>
+<li><code>tail_</code> 节点构造时所有 <code>forward[i]</code> 初始化为 <code>nullptr</code></li>
+<li>内层循环读到 <code>curr == tail_</code> 后继续执行 <code>curr->forward[i]</code>，得到 null</li>
+<li>下一轮 <code>next->marked.load()</code> 解引用 null+32 字节 → SEGV</li>
+</ul>
+<p><b>修复</b>：内层循环顶部加 <code>if (curr == tail_ || curr == nullptr) break;</code>。</p>
+
+<h2>4.2 findNode 前进条件写错</h2>
+<p>修复空指针后单线程测试就丢首尾节点。根因是内层循环条件多了 <code>next != tail_</code>：</p>
+<pre lang="cpp"><code>// 错误：当 curr 是倒数第二个节点、next 是 tail_ 时不前进
+if (next != tail_ &amp;&amp; compareFunc(curr-&gt;value, value) &lt; 0) {
+    pred = curr; curr = next;
+}
+
+// 正确：curr &lt; value 就该前进，不管 next 是谁
+if (compareFunc(curr-&gt;value, value) &lt; 0) {
+    pred = curr; curr = next;
+}</code></pre>
+
+<h2>4.3 remove 越界访问 forward</h2>
+<p>ASan 报 <code>heap-buffer-overflow</code>，读 <code>nodeToRemove-&gt;forward[i]</code>。节点的 <code>forward</code> 向量大小是 <code>topLevel+1</code>，但 remove 循环从 <code>maxLevel(16)</code> 往下遍历到 0，对 <code>i &gt; topLevel</code> 的层级访问了越界内存。</p>
+<p><b>修复</b>：节点增加 <code>level</code> 字段记录实际层数，remove 从 <code>node-&gt;level - 1</code> 开始往下。</p>
+
+<h1>5. Level 2：死循环</h1>
+
+<h2>5.1 remove 重试不检查 findNode 返回值</h2>
+<p>修复越界后程序不再崩溃但挂起。根因：CAS 失败后调用 <code>findNode</code> 刷新 preds/succs，但如果节点已被其他线程摘除，<code>findNode</code> 返回 false，代码不检查返回值，继续用过期的 preds/succs 做 CAS，永远失败。</p>
+<p><b>修复</b>：CAS 失败重试时检查 <code>findNode</code> 返回值，找不到就直接返回：</p>
+<pre lang="cpp"><code>if (!pred-&gt;forward[i].compare_exchange_strong(...)) {
+    if (!findNode(value, preds, succs)) return;  // 节点已被摘除
+}</code></pre>
+
+<h1>6. Level 3：真正的并发同步缺陷</h1>
+
+<h2>6.1 randomLevel 的 PRNG 数据竞争</h2>
+<p>TSan 一开始就报 7 个 race，全部指向 <code>randomLevel()</code> 里的函数局部 <code>static std::mt19937 gen</code>。4 个线程同时调 <code>dis(gen)</code> 竞争同一个 PRNG 内部状态。</p>
+<pre lang="cpp"><code>// 修复：每个线程独立 PRNG
+static thread_local std::random_device rd;
+static thread_local std::mt19937 gen(rd());
+static thread_local std::uniform_real_distribution&lt;&gt; dis(0.0, 1.0);</code></pre>
+
+<h2>6.2 insert 重试未更新 newNode-&gt;forward[i]</h2>
+<p>PRNG 修复后 TSan 干净，但并发 insert 后 find 丢节点。根因：insert 上层链接的 CAS 失败后，<code>findNode</code> 刷新了 preds/succs，但 <code>newNode-&gt;forward[i]</code> 还指向最初的旧 succ。CAS 用新 pred + 旧 succ 必然失败。</p>
+<p><b>修复</b>：重试前把新 succ 写回 <code>newNode-&gt;forward[i]</code>：</p>
+<pre lang="cpp"><code>while (true) {
+    pred = preds[i]; succ = succs[i];
+    newNode-&gt;forward[i].store(succ, relaxed);  // 关键
+    if (pred-&gt;forward[i].compare_exchange_strong(succ, newNode, ...)) break;
+    findNode(value, preds, succs);
+}</code></pre>
+
+<h2>6.3 EBR 回收锁外读</h2>
+<p>TSan 报 <code>retireNode</code> 里对 <code>retired_.size()</code> 的读与另一个线程的写竞争。根因：size 判断在 <code>lock_guard</code> 作用域之外。</p>
+<p><b>修复</b>：把 size 判断放进锁内，用局部变量带出结果。</p>
+
+<h1>7. 安全内存回收（EBR）</h1>
+<p>无锁数据结构里 <code>remove</code> 不能直接 <code>delete</code> 节点——其他线程可能还在读它的 <code>forward</code> 指针。本实现用了简化的 epoch-based reclamation：</p>
+<ul>
+<li>全局 <code>global_epoch</code> 原子计数器</li>
+<li>每个线程 <code>enterThread()</code> 时记录自己观察到的 epoch，<code>leaveThread()</code> 标记退出</li>
+<li><code>retireNode()</code> 把节点挂到 retired 列表（记录当前 epoch）</li>
+<li><code>tryReclaim()</code>：所有活跃线程都观察到新 epoch 后，安全回收旧 epoch 的节点</li>
+</ul>
+
+<h1>8. 最终验证结果</h1>
+
+<table>
+<thead><tr><th>检查</th><th>命令</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td>ThreadSanitizer</td><td><code>make tsan</code></td><td>0 warnings, ALL TESTS PASSED</td></tr>
+<tr><td>AddressSanitizer</td><td><code>make asan</code></td><td>0 errors, ALL TESTS PASSED</td></tr>
+<tr><td>压力测试</td><td>4 线程 × 1000 op × 10 轮</td><td>10/10 PASS</td></tr>
+<tr><td>单线程测试</td><td>100 节点 insert/find</td><td>size=100, 0 missing</td></tr>
+</tbody>
+</table>
+
+<h1>9. 经验教训</h1>
+
+<ol>
+<li><b>先修测试再修数据结构</b>：前两个 bug 都在测试代码（悬垂指针、分配器参数），直接对着数据结构排查会浪费时间。</li>
+<li><b>单线程跑通再上并发</b>：4.2 的前进条件错误单线程就能复现，不用等并发场景。</li>
+<li><b>ASan 和 TSan 互补</b>：ASan 抓内存错误（空指针、越界、UAF），TSan 抓同步问题。两者都要跑。</li>
+<li><b>无锁算法里 retry 路径最容易漏</b>：CAS 失败后的刷新逻辑、返回值检查、新节点 forward 更新，每一处都可能出 bug。</li>
+<li><b>tail_ 哨兵要特殊处理</b>：它的 forward 是 null，遍历时必须在 <code>curr == tail_</code> 时停手，不能把它当普通节点解引用。</li>
+<li><b>节点要记录自己的层数</b>：remove 遍历层级不能从 maxLevel 开始，必须从节点实际层级开始，否则越界。</li>
+</ol>
+
+<hr/>
+<p>项目位置：<code>~/Projects/lockfree-skiplist</code>，构建命令 <code>make &amp;&amp; make test</code>。</p>
